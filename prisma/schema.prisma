@@ -1,0 +1,49 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+//HERE WE ARE GOING TO DECLARE OUR MODELS
+
+generator client {
+  provider = "prisma-client-js" //it going to use prisma/clinet library we installed
+}
+
+datasource db {
+  provider = "postgresql" //we can use mysql or mongodb
+  url      = env("DATABASE_URL")
+}
+
+//we are having two models
+
+model User {
+  id Int @id @default(autoincrement()) //telling id is ID field and it was incrementing one
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  email String @unique  //Users table will have email & password and optionally firstname & lastname
+  hash String
+
+  firstName String?
+  lastName String?
+
+  bookmarks Bookmark[] //array of books 
+  @@map("users")
+}
+
+model Bookmark {
+  id Int @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  title String
+  link String
+  description String?
+
+  userId Int //user Id of the user (foreign key that references User)
+  user User @relation(fields: [userId] , references: [id])
+
+  @@map("bookmarks")
+}
+// user -> field name will have 'User' Object of localfield userId references foreign field (id) in User
