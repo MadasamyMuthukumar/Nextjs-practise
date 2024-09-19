@@ -29,7 +29,9 @@ model User {
   lastName String?
 
   bookmarks Bookmark[] //array of books 
-  @@map("users")
+
+  // role: Role  define role enum 
+
 }
 
 model Bookmark {
@@ -42,8 +44,15 @@ model Bookmark {
   description String?
 
   userId Int //user Id of the user (foreign key that references User)
-  user User @relation(fields: [userId] , references: [id])
+  user User @relation(fields: [userId] , references: [id], onDelete: Cascade)
+  // ondelete -> when the reference field get deleted, this field also 
+  // deleted automatically 
 
-  @@map("bookmarks")
+
 }
 // user -> field name will have 'User' Object of localfield userId references foreign field (id) in User
+// enum Role{
+//   Intern
+//   Student 
+//   master
+// }
