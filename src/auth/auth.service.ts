@@ -11,7 +11,7 @@ import { ConfigService } from "@nestjs/config";
 //This service will handle two functionalitiess login and signup
 @Injectable()
 export class AuthService {
-    constructor(private prisma: PrismaService, private jwt: JwtService, private config : ConfigService) { }
+    constructor(private prisma: PrismaService, private jwt: JwtService,private config : ConfigService) { }
     //It will store the bussinenss logic for login & singup
     async signin(dto:AuthDto) {
         //check user exists 
@@ -24,6 +24,7 @@ export class AuthService {
         if(!user) throw new ForbiddenException('No user available with this email!')
 
          const pwMatches =await argon.verify(user.hash , dto.password)
+
          console.log(pwMatches)
         if(!pwMatches)  throw new ForbiddenException('Password or Email mismatches!')
         // delete user.hash
@@ -40,7 +41,7 @@ export class AuthService {
         const user = await this.prisma.user.create({
             data: {
                 email: dto.email,
-                hash
+                hash,
             }, //selecting the only fields we want
             // select: {
             //     id: true,
