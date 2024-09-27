@@ -99,4 +99,18 @@ export class BookmarkService {
         return groupPost
 
     }
+
+
+    //get all group posts
+    async getAllGroupPosts(){
+        return await this.prisma.groupPost.findMany({
+            include:{
+                users:{
+                    select:{
+                        user:true
+                    }
+                }
+            }
+        })
+    }
 }

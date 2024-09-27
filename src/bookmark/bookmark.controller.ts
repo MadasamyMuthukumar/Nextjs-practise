@@ -3,7 +3,7 @@ import { BookmarkService } from './bookmark.service';
 import { JwtGaurd } from 'src/auth/gaurds';
 import { GetUser } from 'src/auth/decorators';
 import { Prisma, User } from '@prisma/client';
-import { CreateBookmarkDto, EditBookmarkDto} from './dto';
+import { CreateBookmarkDto, EditBookmarkDto } from './dto';
 import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import { CreateGroupPostDto } from './dto/createGroupPost.dto';
 
@@ -33,6 +33,10 @@ export class BookmarkController {
         } catch (err) {
             throw new HttpException('Error while getting', HttpStatus.INTERNAL_SERVER_ERROR, { cause: err })
         }
+    }
+    @Get('/group-posts')
+    welcome(){
+        return this.bookmarkService.getAllGroupPosts()
     }
 
     @Get('/:id')
@@ -67,9 +71,11 @@ export class BookmarkController {
 
     @Post('/group/create')
     //seperating userId from the createGroupPostDto
-    createGroupPost(@Body() {userIds, ...createGroupPostDto}: CreateGroupPostDto ){
+    createGroupPost(@Body() { userIds, ...createGroupPostDto }: CreateGroupPostDto) {
         // return createGroupPostDto
-        return this.bookmarkService.createGroupPost(userIds,createGroupPostDto)
+        return this.bookmarkService.createGroupPost(userIds, createGroupPostDto)
     }
-  
+
+
+
 }
