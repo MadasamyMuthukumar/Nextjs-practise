@@ -3,6 +3,7 @@ import { CreateBookmarkDto, EditBookmarkDto } from './dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { UserCreatedEvent } from 'src/events/user-created.event';
+import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class BookmarkService {
@@ -46,7 +47,6 @@ export class BookmarkService {
 
         this.emitter.emit('bookmark.created',bookmark)
         return bookmark
-  
     }
 
    
@@ -82,5 +82,21 @@ export class BookmarkService {
             }
         })
         return deletedBookmark
+    }
+
+    //creating group posts
+    //passing userIds and groupost data(title,desc) seperateley
+    async createGroupPost(userIds:number[], groupPostData:Prisma.GroupPostCreateWithoutUsersInput){
+     const groupPost= await this.prisma.groupPost.create({
+            data:{
+                ...groupPostData,
+                //mapping through userIds array and assign elements to users array
+                users:{
+                    create: userIds.map((userId)=> ({userId}))
+                }
+            }
+        })
+        return groupPost
+
     }
 }

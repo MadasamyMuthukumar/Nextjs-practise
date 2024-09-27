@@ -3,8 +3,9 @@ import { BookmarkService } from './bookmark.service';
 import { JwtGaurd } from 'src/auth/gaurds';
 import { GetUser } from 'src/auth/decorators';
 import { Prisma, User } from '@prisma/client';
-import { CreateBookmarkDto, EditBookmarkDto } from './dto';
+import { CreateBookmarkDto, EditBookmarkDto} from './dto';
 import { SkipThrottle, Throttle } from '@nestjs/throttler';
+import { CreateGroupPostDto } from './dto/createGroupPost.dto';
 
 
 // @SkipThrottle()  //this entrie controller will skip the limiting
@@ -60,6 +61,15 @@ export class BookmarkController {
     deleteBookmarkById(@GetUser('id') userId: number,
         @Param('id', ParseIntPipe) bookmarkId: number) {
         return this.bookmarkService.deleteBookmarkById(userId, bookmarkId)
+    }
+
+    //using this controller for group posts
+
+    @Post('/group/create')
+    //seperating userId from the createGroupPostDto
+    createGroupPost(@Body() {userIds, ...createGroupPostDto}: CreateGroupPostDto ){
+        // return createGroupPostDto
+        return this.bookmarkService.createGroupPost(userIds,createGroupPostDto)
     }
   
 }

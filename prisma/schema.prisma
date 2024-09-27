@@ -28,9 +28,25 @@ model User {
   firstName String?
   lastName String?
 
-  bookmarks Bookmark[] //array of books 
+  bookmarks Bookmark[] //array of books  one-many realtion
+  userSettings UserSettings? //optional field there may be user without settings one-one relation
+
+  groupPosts UserGroupPost[] 
 
   // role: Role  define role enum 
+
+}
+
+model UserSettings {
+   id Int @id @default(autoincrement()) //telling id is ID field and it was incrementing one
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  notificationEnabled String
+  smsEnabled String
+
+  userId Int @unique   //settings must have one user
+  user User @relation(fields: [userId],references: [id], onDelete: Cascade)
 
 }
 
@@ -48,11 +64,34 @@ model Bookmark {
   // ondelete -> when the reference field get deleted, this field also 
   // deleted automatically 
 
-
 }
+
+model GroupPost {
+  id Int @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  title String
+  description String
+
+  users UserGroupPost[]
+}
+
+//joined table having primary keys of users and group posts
+model UserGroupPost {
+  userId Int
+  groupId Int 
+
+  user User @relation(fields: [userId], references: [id])
+  groupPost GroupPost @relation(fields: [groupId],references: [id])
+
+  @@id([userId,groupId])  // Composite primary key to prevent duplicates
+}
+
 // user -> field name will have 'User' Object of localfield userId references foreign field (id) in User
 // enum Role{
 //   Intern
 //   Student 
 //   master
 // }
+

@@ -22,4 +22,17 @@ export class UserService {
         return user
 
     }
+
+
+    async getUser(){
+        // return await this.prisma.user.findMany({ include:{ UserSetting:true}}) or
+                        // {
+                        //     userSetting:{
+                        //         select:{
+                        //             smsEnabled:true
+                        //         }
+                        //     }
+                        // }
+        //this will incldue the userSettings details as well along with user feilds
+    }
 }
