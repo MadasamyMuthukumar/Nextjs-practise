@@ -1,10 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { CreateBookmarkDto, EditBookmarkDto } from './dto';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { UserCreatedEvent } from 'src/events/user-created.event';
 
 @Injectable()
 export class BookmarkService {
-    constructor(private prisma:PrismaService){}
+    constructor(private prisma:PrismaService, private emitter:EventEmitter2){}
     
     /**Getting all the bookmarks from specified userId */
     async getBookmarks(userId:number){
@@ -41,7 +43,10 @@ export class BookmarkService {
                 ...dto
             }
         })
+
+        this.emitter.emit('bookmark.created',bookmark)
         return bookmark
+  
     }
 
    

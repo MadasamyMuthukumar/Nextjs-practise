@@ -9,7 +9,9 @@ import { ConfigModule } from '@nestjs/config';
 import { ServiceController } from './service/service.controller';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
-
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { ScheduleModule } from '@nestjs/schedule';
+import { ListenerModule } from './listener/listener.module';
 @Module({
   imports: [ConfigModule.forRoot({
     isGlobal:true //making cofigService globally available 
@@ -27,7 +29,7 @@ import { APP_GUARD } from '@nestjs/core';
       ttl:1000,
       limit:2
     }
-  ])], 
+  ]) , EventEmitterModule.forRoot() , ScheduleModule.forRoot(), ListenerModule], 
   controllers: [AppController, ServiceController],
 
   providers: [AppService,{
