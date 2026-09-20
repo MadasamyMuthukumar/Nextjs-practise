@@ -1,0 +1,383 @@
+==============================================================================
+  AUTH-DEMO MODULE - FULL SOURCE
+  NestJS JWT auth + role-based guards (in-memory users, no database)
+
+  Project : Nextjs-practise
+  Exported: 2026-09-20 19:34
+==============================================================================
+
+ROUTES EXPOSED BY THIS MODULE
+------------------------------------------------------------------------------
+  POST   /auth/login      public       -> returns { access_token }
+  GET    /users           AuthGuard    -> returns the decoded JWT payload
+  DELETE /users/:id       AuthGuard + RoleGaurd, ADMIN only
+
+TEST CREDENTIALS (hardcoded in users.service.ts)
+------------------------------------------------------------------------------
+  user1@gmail.com / user1   role: ADMIN
+  user2@gmail.com / user2   role: USER
+
+FILE INDEX
+------------------------------------------------------------------------------
+  1. src/auth-demo/auth-demo.module.ts
+  2. src/auth-demo/users/roles.type.ts
+  3. src/auth-demo/users/users.service.ts
+  4. src/auth-demo/auth/auth.service.ts
+  5. src/auth-demo/auth/auth.controller.ts
+  6. src/auth-demo/auth/auth.guard.ts
+  7. src/auth-demo/auth/role.decorator.ts
+  8. src/auth-demo/auth/role.guard.ts
+  9. src/auth-demo/users/users.controller.ts
+  A. src/app.module.ts   (appendix - the registration that makes it all work)
+
+
+==============================================================================
+  FILE 1:  src/auth-demo/auth-demo.module.ts
+------------------------------------------------------------------------------
+  Module wiring. Registers both controllers and the JWT secret.
+==============================================================================
+
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import { AuthController } from './auth/auth.controller';
+import { AuthService } from './auth/auth.service';
+import { USersController } from './users/users.controller';
+import { UsersService } from './users/users.service';
+
+@Module({
+  imports: [
+    //registering jwt with the secret from .env (ConfigModule is global in AppModule)
+    JwtModule.registerAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        secret: config.get('JWT_SECRET'),
+        signOptions: { expiresIn: '1h' },
+      }),
+    }),
+  ],
+  //controllers must be listed here, otherwise nest never maps their routes
+  controllers: [AuthController, USersController],
+  //AuthGuard & RoleGaurd are not listed -> @UseGuards instantiates them
+  //from this module's injector (JwtService comes from JwtModule above)
+  providers: [AuthService, UsersService],
+})
+export class AuthDemoModule {}
+
+
+==============================================================================
+  FILE 2:  src/auth-demo/users/roles.type.ts
+------------------------------------------------------------------------------
+  The ROLES enum. Note: numeric enum, so ADMIN = 0 and USER = 1.
+==============================================================================
+
+
+
+export enum ROLES  {
+    ADMIN,
+    USER
+}
+
+==============================================================================
+  FILE 3:  src/auth-demo/users/users.service.ts
+------------------------------------------------------------------------------
+  In-memory user store (no database). Seeds 2 users with bcrypt hashes.
+==============================================================================
+
+import { Injectable } from "@nestjs/common";
+import * as bcrypt from 'bcrypt'
+import { ROLES } from "./roles.type";
+
+@Injectable()
+export class UsersService {
+
+    private Users = [
+        {
+            id: 1,
+            email: 'user1@gmail.com',
+            password: bcrypt.hashSync('user1', 10),
+            role: ROLES.ADMIN
+        },
+          {
+            id: 2,
+            email: 'user2@gmail.com',
+            password: bcrypt.hashSync('user2', 10),
+            role: ROLES.USER
+        }
+    ]
+
+    findByEmail(email) {
+        return this.Users.find(user => user.email== email)
+    }
+
+    createUser(email, password, role){
+        this.Users.push({
+            id: this.Users.length +1,
+            email,
+            password,
+            role
+        })
+    }
+}
+
+==============================================================================
+  FILE 4:  src/auth-demo/auth/auth.service.ts
+------------------------------------------------------------------------------
+  Login logic: look up user, compare password, sign a JWT.
+==============================================================================
+
+import { Injectable, UnauthorizedException } from "@nestjs/common";
+import { JwtService } from "@nestjs/jwt";
+import { UsersService } from "../users/users.service";
+import * as bcrypt from 'bcrypt'
+
+
+@Injectable()
+export class AuthService {
+
+    constructor(
+        private readonly jwtService: JwtService,
+        private readonly usersService: UsersService
+    ){}
+
+    
+
+    async login(email, password){
+        const user = this.usersService.findByEmail(email)
+
+        if(!user) throw new UnauthorizedException()
+
+        const isPasswordMatch = await bcrypt.compare(password, user.password)
+
+        if(!isPasswordMatch) throw new UnauthorizedException()
+
+        const payload = {
+            sub: user.id,
+            email: user.email,
+            role: user.role
+        }
+
+        const accessToken = await this.jwtService.signAsync(payload)
+
+        return {
+            access_token : accessToken
+        }
+
+
+    }
+}
+
+==============================================================================
+  FILE 5:  src/auth-demo/auth/auth.controller.ts
+------------------------------------------------------------------------------
+  POST /auth/login
+==============================================================================
+
+import { Body, Controller, Post } from "@nestjs/common";
+import { AuthService } from "./auth.service";
+import { SkipThrottle } from "@nestjs/throttler";
+
+
+
+@SkipThrottle({ long: true, short: true })  //must name both throttlers - bare SkipThrottle() targets 'default', which this app does not register
+@Controller('auth')
+export class AuthController {
+
+    constructor(
+        private readonly authservice: AuthService
+    ){}
+
+    @Post('login')
+    async login(@Body() body: {email: string, password: string}){
+        return this.authservice.login(body.email, body.password)
+    }
+}
+
+==============================================================================
+  FILE 6:  src/auth-demo/auth/auth.guard.ts
+------------------------------------------------------------------------------
+  Reads the Bearer token, verifies it, puts the payload on req.user.
+==============================================================================
+
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
+import { JwtService } from "@nestjs/jwt";
+import { Observable } from "rxjs";
+
+
+
+@Injectable()
+export class AuthGuard implements CanActivate {
+
+    constructor(
+        private readonly jwtService: JwtService
+    ){}
+
+    async canActivate(context: ExecutionContext): Promise<boolean> {
+        
+        const request = context.switchToHttp().getRequest()
+
+        const authHeader = request.headers.authorization
+
+        if(!authHeader) throw new UnauthorizedException()
+
+        const [type, token] = authHeader.split(' ')
+
+        if(type !='Bearer' || !token) throw new UnauthorizedException()
+
+        try {
+            const payload = await this.jwtService.verifyAsync(token)
+            request.user = payload
+            return true
+        }catch{
+            // return false
+            throw new UnauthorizedException()
+        }
+    }
+}
+
+==============================================================================
+  FILE 7:  src/auth-demo/auth/role.decorator.ts
+------------------------------------------------------------------------------
+  @Roles(...) - attaches required roles as route metadata.
+==============================================================================
+
+import { SetMetadata } from "@nestjs/common";
+import { ROLES } from "../users/roles.type";
+
+export const ROLE_KEY = 'ROLES'
+
+export const Roles = (...allowedRoles: ROLES[]) => SetMetadata(ROLE_KEY, allowedRoles)
+
+==============================================================================
+  FILE 8:  src/auth-demo/auth/role.guard.ts
+------------------------------------------------------------------------------
+  Reads that metadata and compares it against req.user.role.
+==============================================================================
+
+import { CanActivate, ExecutionContext, ForbiddenException, Injectable, UnauthorizedException } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { Observable } from "rxjs";
+import { ROLE_KEY } from "./role.decorator";
+
+
+
+@Injectable()
+export class RoleGaurd implements CanActivate {
+
+    constructor(
+        private readonly reflector: Reflector
+    ){}
+    async canActivate(context: ExecutionContext): Promise<boolean> {
+        const requiredRoles = this.reflector.getAllAndOverride(ROLE_KEY, [ context.getHandler(), context.getClass() ])
+
+        if(!requiredRoles) return true
+
+        const user = context.switchToHttp().getRequest()?.user
+
+        if(!user) throw new ForbiddenException()
+
+        const isValid = requiredRoles.includes(user.role)
+
+        if(!isValid) throw new ForbiddenException()
+
+        return true
+    }
+}
+
+==============================================================================
+  FILE 9:  src/auth-demo/users/users.controller.ts
+------------------------------------------------------------------------------
+  GET /users and DELETE /users/:id - the guard-protected routes.
+==============================================================================
+
+import { Body, Controller, Delete, Get, Param, Req, UseGuards } from "@nestjs/common";
+import { AuthGuard } from "../auth/auth.guard";
+import { RoleGaurd } from "../auth/role.guard";
+import { Roles } from "../auth/role.decorator";
+import { ROLES } from "./roles.type";
+import { SkipThrottle } from "@nestjs/throttler";
+
+
+
+@SkipThrottle({ long: true, short: true })  //must name both throttlers - bare SkipThrottle() targets 'default', which this app does not register
+@Controller('users')
+export class USersController {
+
+    @UseGuards(AuthGuard)
+    @Get()
+    async getProfile(
+        @Req() req: any
+    ){
+        return {
+           user: req.user
+        }  
+    }
+
+
+    @UseGuards(AuthGuard, RoleGaurd)
+    @Roles(ROLES.ADMIN)
+    @Delete(':id')
+    async deleteUser(@Param('id') id: string){
+         
+     return {
+        message: `deleted ${id}`
+     }
+    }
+}
+
+==============================================================================
+  APPENDIX A:  src/app.module.ts
+------------------------------------------------------------------------------
+  Not part of the module, but required. A controller only gets a route
+  if its module is registered here. Without the AuthDemoModule line
+  below, POST /auth/login returns 404 Not Found.
+==============================================================================
+
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { AuthModule } from './auth/auth.module';
+import { UserModule } from './user/user.module';
+import { BookmarkModule } from './bookmark/bookmark.module';
+import { PrismaModule } from './prisma/prisma.module';
+import { ConfigModule } from '@nestjs/config';
+// import { ServiceController } from './service/service.controller';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { ScheduleModule } from '@nestjs/schedule';
+import { ListenerModule } from './listener/listener.module';
+import { AuthDemoModule } from './auth-demo/auth-demo.module';
+@Module({
+  imports: [ConfigModule.forRoot({
+    isGlobal:true //making cofigService globally available 
+  }), //this will add our env file to all our application
+     AuthModule, UserModule, BookmarkModule, PrismaModule,
+     //we are defining two limits here short & long
+    ThrottlerModule.forRoot([
+      {
+        name:'long',
+      ttl:60000,
+      limit:3  //limiting 3 request per minute
+    },
+    {
+      name:'short',
+      ttl:1000,
+      limit:2
+    }
+  ]) , EventEmitterModule.forRoot() , ScheduleModule.forRoot(), ListenerModule, AuthDemoModule], 
+  controllers: [AppController],
+
+  providers: [AppService,{
+    provide:APP_GUARD,   //providing rate limiting to all our controller routes
+    useClass:ThrottlerGuard,
+    
+
+  }],
+})
+export class AppModule {}
+
+
+==============================================================================
+  END OF FILE
+==============================================================================
