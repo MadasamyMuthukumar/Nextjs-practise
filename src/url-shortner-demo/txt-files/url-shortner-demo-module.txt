@@ -1,0 +1,428 @@
+==============================================================================
+  URL-SHORTNER-DEMO MODULE - FULL SOURCE
+  NestJS url shortener - create, redirect, stats (in-memory Map, no database)
+
+  Project : Nextjs-practise
+  Exported: 2026-09-23 22:50
+==============================================================================
+
+WHAT THIS MODULE DOES
+------------------------------------------------------------------------------
+  Takes a long url, stores it under a 7 character code, and 302-redirects
+  anyone who hits that code. Optional custom alias, optional expiry, and a
+  click counter per link. Everything lives in a Map, so a restart wipes it.
+
+ROUTES  (base path /url)
+------------------------------------------------------------------------------
+  POST  /url/create            body -> CreateUrlDto     returns the short url
+  GET   /url/stats/:shortcode  read counters, never counts as a click
+  GET   /url/:shortcode        302 redirect to longUrl, increments the counter
+
+  Route order matters here. /url/stats/:shortcode is TWO path segments and
+  /url/:shortcode is ONE, so express never confuses them - "stats" can never
+  be swallowed as a shortcode.
+
+REQUEST BODY  (POST /url/create)
+------------------------------------------------------------------------------
+  longUrl           required   must include http:// or https://
+  customAlias       optional   3-32 chars, [A-Za-z0-9_-] only
+  expiresInMinutes  optional   integer >= 1; omit it and the link never expires
+
+  {
+    "longUrl": "https://nestjs.com/",
+    "customAlias": "nest-docs",
+    "expiresInMinutes": 60
+  }
+
+RESPONSE CODES
+------------------------------------------------------------------------------
+  201  link created
+  302  redirect, with the target in the Location header
+  400  validation failed, or the customAlias is already taken
+  404  no link stored under that shortcode
+  410  the link existed but its expiry has passed  (GoneException)
+
+TESTING IN POSTMAN
+------------------------------------------------------------------------------
+  Turn OFF Settings -> "Automatically follow redirects" before calling
+  GET /url/:shortcode. Otherwise Postman follows the hop and shows you the
+  destination website instead of your own 302 + Location header.
+
+  The global ThrottlerGuard allows only 3 requests per minute, which makes
+  manual testing painful, so the controller carries
+  @SkipThrottle({ long: true, short: true }).
+
+WHY expired_at IS NULLABLE
+------------------------------------------------------------------------------
+  null           = this link never expires  (the default)
+  a Date in the future = still valid
+  a Date in the past   = expired, redirect answers 410
+
+  The check is `expired_at <= new Date()`. Writing it the other way round
+  (>=) inverts the whole feature: every link that is still valid throws,
+  and only already-dead links redirect.
+
+BUGS THAT WERE FIXED IN THIS MODULE  (keep these in mind)
+------------------------------------------------------------------------------
+  1. The @Module had empty providers/controllers arrays. The app booted fine
+     and the routes simply did not exist - every call returned 404.
+  2. `let code;` in generateShortCode starts as undefined, so the first
+     `code += ...` stringifies it and every code read "undefinedk3j2a9f".
+     It must be `let code = ''`.
+  3. createUrl set expired_at to `new Date()` - every link was born already
+     expired - AND the redirect check was inverted. Two bugs cancelling into
+     "nothing ever works".
+  4. redirect() read record.longUrl without checking that record existed, so
+     an unknown shortcode threw a TypeError and returned 500 instead of 404.
+  5. The custom-alias branch returned early after storing the raw request
+     body, so clicksCount was undefined and `clicksCount += 1` gave NaN.
+  6. @Body() data: any meant the global ValidationPipe({whitelist:true}) had
+     no DTO class to validate or strip against - anything was accepted.
+  7. Without require_protocol on the url, res.redirect(302, 'google.com')
+     redirects RELATIVE to your own server, not to google.
+
+FILE INDEX
+------------------------------------------------------------------------------
+  1. src/url-shortner-demo/url-shortner-demo.module.ts
+  2. src/url-shortner-demo/dto/create-url.dto.ts
+  3. src/url-shortner-demo/url-shortner-demo-repo.service.ts
+  4. src/url-shortner-demo/url-shortner-demo.service.ts
+  5. src/url-shortner-demo/url-shortner.controller.ts
+  A. src/app.module.ts   (appendix - the registration that makes it all work)
+
+
+==============================================================================
+  FILE 1:  src/url-shortner-demo/url-shortner-demo.module.ts
+------------------------------------------------------------------------------
+  Module wiring. The repo service is a provider too - it is not exported,
+  so only this module can inject it. If either provider is missing from
+  this list Nest throws a dependency-resolution error at boot.
+
+  The file is named *.module.ts on purpose: app.module.ts imports it by
+  path, and the old name (url-shortner-demo.ts) broke that convention.
+==============================================================================
+
+import { Module } from "@nestjs/common";
+import { UrlShortnerController } from "./url-shortner.controller";
+import { UrlShortnerDemoService } from "./url-shortner-demo.service";
+import { UrlShortnerDemoRepoService } from "./url-shortner-demo-repo.service";
+
+
+@Module({
+    imports: [],
+    controllers: [UrlShortnerController],
+    providers: [UrlShortnerDemoService, UrlShortnerDemoRepoService]
+})
+
+
+export class UrlShortnerDemoModule {}
+
+==============================================================================
+  FILE 2:  src/url-shortner-demo/dto/create-url.dto.ts
+------------------------------------------------------------------------------
+  The request contract. main.ts installs ValidationPipe({whitelist:true})
+  globally, which only does something when the body is typed as a class
+  like this one - with `@Body() data: any` nothing is validated or stripped.
+
+  require_protocol is not cosmetic: express treats a url without a scheme
+  as a path on your own host, so "google.com" would redirect to
+  http://localhost:3000/google.com instead of leaving your server.
+==============================================================================
+
+import { IsInt, IsNotEmpty, IsOptional, IsString, Matches, Min, MaxLength, MinLength, IsUrl } from "class-validator"
+
+
+export class CreateUrlDto {
+    //require_protocol so express res.redirect() gets an absolute url, not a relative one
+    @IsUrl({ require_protocol: true }, { message: 'longUrl must include http:// or https://' })
+    @IsNotEmpty()
+    longUrl: string
+
+    @IsString()
+    @MinLength(3)
+    @MaxLength(32)
+    @Matches(/^[A-Za-z0-9_-]+$/, { message: 'customAlias may only contain letters, numbers, - and _' })
+    @IsOptional()
+    customAlias?: string
+
+    //optional ttl - when omitted the link never expires
+    @IsInt()
+    @Min(1)
+    @IsOptional()
+    expiresInMinutes?: number
+}
+
+==============================================================================
+  FILE 3:  src/url-shortner-demo/url-shortner-demo-repo.service.ts
+------------------------------------------------------------------------------
+  The storage layer - a plain Map keyed by shortcode, no database.
+  create() refuses to overwrite an existing key, which is the last line
+  of defence against two links colliding on the same code.
+
+  incrementClickCount mutates the stored object in place. That works only
+  because the Map holds object references, not copies.
+==============================================================================
+
+import { BadRequestException, Injectable } from "@nestjs/common";
+
+export interface Url {
+    shortCode: string,
+    longUrl: string,
+    expired_at: Date | null,
+    clicksCount: number,
+    createdAt: Date | null,
+    lastClickedAt: Date | null,
+    customAlias: string | null
+}
+
+@Injectable()
+export class UrlShortnerDemoRepoService {
+    constructor() {}
+
+    private urls = new Map<string, Url>()
+
+
+    findByShortcode(shortCode: string): Url | undefined {
+        return this.urls.get(shortCode)
+    }
+
+    exists(shortCode: string): boolean {
+        return this.urls.has(shortCode)
+    }
+
+    create(urlObject: Url) {
+        const isShortcodeExists = this.urls.has(urlObject.shortCode)
+
+        if (isShortcodeExists) throw new BadRequestException(`shortcode "${urlObject.shortCode}" is already taken`)
+
+        this.urls.set(urlObject.shortCode, urlObject)
+
+        return urlObject
+    }
+
+    incrementClickCount(shortCode: string): void {
+    const record = this.urls.get(shortCode);
+
+    if (!record) {
+      return;
+    }
+
+    record.clicksCount += 1;
+    record.lastClickedAt = new Date();
+  }
+}
+
+==============================================================================
+  FILE 4:  src/url-shortner-demo/url-shortner-demo.service.ts
+------------------------------------------------------------------------------
+  The business rules. Three things worth noticing:
+
+  - generateUniqueShortCode retries up to 5 times. randomInt can repeat a
+    code, and Map.set would silently overwrite the older link if it did.
+  - expired_at is null when no ttl was asked for, and the expiry check is
+    `<= new Date()` - see the WHY expired_at IS NULLABLE note above.
+  - both branches (custom alias and generated code) build one complete Url
+    record before storing. Returning early with the raw dto leaves
+    clicksCount/createdAt undefined and corrupts the click counter.
+==============================================================================
+
+import { BadRequestException, GoneException, Injectable, NotFoundException } from "@nestjs/common";
+import { Url, UrlShortnerDemoRepoService } from "./url-shortner-demo-repo.service";
+import { CreateUrlDto } from "./dto/create-url.dto";
+import { randomInt } from "crypto";
+
+
+
+
+@Injectable()
+export class UrlShortnerDemoService {
+    constructor(
+        private readonly urlreposervice: UrlShortnerDemoRepoService
+    ) { }
+
+    private readonly randomCOde = 'asdfghjkwertyuioxcvbnm123456789sdfghjzxcvbnm'
+
+    private readonly baseUrl = process.env.APP_BASE_URL ?? 'http://localhost:3000'
+
+    async createUrl(dto: CreateUrlDto) {
+        const customAlias = dto.customAlias
+
+        if (customAlias && this.urlreposervice.exists(customAlias)) {
+            throw new BadRequestException(`customAlias "${customAlias}" is already taken`)
+        }
+
+        //a custom alias is used as-is, otherwise generate one that is not taken yet
+        const shortCode = customAlias ?? this.generateUniqueShortCode()
+
+        const record: Url = {
+            shortCode: shortCode,
+            longUrl: dto.longUrl,
+            clicksCount: 0,
+            lastClickedAt: null,
+            createdAt: new Date(),
+            //no ttl given -> null means the link never expires
+            expired_at: dto.expiresInMinutes
+                ? new Date(Date.now() + dto.expiresInMinutes * 60_000)
+                : null,
+            customAlias: customAlias ?? null
+        }
+
+        this.urlreposervice.create(record)
+
+        return {
+            shortCode: record.shortCode,
+            shortUrl: `${this.baseUrl}/url/${record.shortCode}`,
+            longUrl: record.longUrl,
+            expired_at: record.expired_at
+        }
+    }
+
+
+    async redirect(shortCode: string) {
+        const record = this.urlreposervice.findByShortcode(shortCode)
+
+        if (!record) throw new NotFoundException(`no url found for shortcode "${shortCode}"`)
+
+        //expired only when the expiry timestamp is already in the past
+        if (record.expired_at && record.expired_at <= new Date()) {
+            throw new GoneException(`shortcode "${shortCode}" has expired`)
+        }
+
+        this.urlreposervice.incrementClickCount(shortCode)
+
+        return record.longUrl
+    }
+
+    async getStats(shortCode: string) {
+        const record = this.urlreposervice.findByShortcode(shortCode)
+
+        if (!record) throw new NotFoundException(`no url found for shortcode "${shortCode}"`)
+
+        return record
+    }
+
+    private generateUniqueShortCode(): string {
+        //generated codes can collide, so retry a few times before giving up
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const code = this.generateShortCode()
+            if (!this.urlreposervice.exists(code)) return code
+        }
+
+        throw new BadRequestException('could not generate a unique shortcode, please retry')
+    }
+
+    private generateShortCode() {
+        let code = ''
+        for (let i = 0; i < 7; i++) {
+            code += this.randomCOde[
+                randomInt(0, this.randomCOde.length)
+            ]
+        }
+
+        return code
+    }
+}
+
+==============================================================================
+  FILE 5:  src/url-shortner-demo/url-shortner.controller.ts
+------------------------------------------------------------------------------
+  The HTTP surface. @Res() is used on the redirect route because we need
+  express res.redirect() to set the Location header - be aware that taking
+  @Res() switches that handler into manual mode, so Nest will no longer
+  serialise a returned value for it.
+
+  @SkipThrottle names both throttlers explicitly; a bare @SkipThrottle()
+  targets a throttler called "default", which this app never registers.
+==============================================================================
+
+import { Body, Controller, Get, Param, Post, Res } from "@nestjs/common";
+import { UrlShortnerDemoService } from "./url-shortner-demo.service";
+import { Response } from 'express'
+
+
+@Controller('url')
+export class UrlShortnerController {
+    constructor(
+        private readonly urlshorterService : UrlShortnerDemoService
+    ){}
+
+
+    @Post('create')
+    async creatUrl(@Body() data: any){
+        return this.urlshorterService.createUrl(data)
+    }
+
+
+    @Get(':shortcode')
+    async redirect(
+        @Param('shortcode') code: string,
+        @Res() res: Response
+    ){
+        const url = await this.urlshorterService.redirect(code)
+        return res.redirect(302, url)
+
+    }
+}
+==============================================================================
+  APPENDIX A:  src/app.module.ts
+------------------------------------------------------------------------------
+  Not part of the module, but required. A controller only gets routes if
+  its module is registered here. Without the UrlShortnerDemoModule entry
+  below, /url/create answers 404 no matter how correct the module is.
+
+  This is also where the named throttlers "long" and "short" come from,
+  which is why the controller writes
+  @SkipThrottle({ long: true, short: true }) and not a bare @SkipThrottle().
+==============================================================================
+
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { AuthModule } from './auth/auth.module';
+import { UserModule } from './user/user.module';
+import { BookmarkModule } from './bookmark/bookmark.module';
+import { PrismaModule } from './prisma/prisma.module';
+import { ConfigModule } from '@nestjs/config';
+// import { ServiceController } from './service/service.controller';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { ScheduleModule } from '@nestjs/schedule';
+import { ListenerModule } from './listener/listener.module';
+import { AuthDemoModule } from './auth-demo/auth-demo.module';
+import { WebsocketDemoModule } from './websocket-demo/websocket-demo.module';
+import { FileUploadDemoModule } from './file-upload-demo/file-upload-demo.module';
+import { UrlShortnerDemoModule } from './url-shortner-demo/url-shortner-demo.module';
+@Module({
+  imports: [ConfigModule.forRoot({
+    isGlobal:true //making cofigService globally available 
+  }), //this will add our env file to all our application
+     AuthModule, UserModule, BookmarkModule, PrismaModule,
+     //we are defining two limits here short & long
+    ThrottlerModule.forRoot([
+      {
+        name:'long',
+      ttl:60000,
+      limit:3  //limiting 3 request per minute
+    },
+    {
+      name:'short',
+      ttl:1000,
+      limit:2
+    }
+  ]) , EventEmitterModule.forRoot() , ScheduleModule.forRoot(), ListenerModule, AuthDemoModule, WebsocketDemoModule, FileUploadDemoModule, UrlShortnerDemoModule], 
+  controllers: [AppController],
+
+  providers: [AppService,{
+    provide:APP_GUARD,   //providing rate limiting to all our controller routes
+    useClass:ThrottlerGuard,
+    
+
+  }],
+})
+export class AppModule {}
+
+
+==============================================================================
+  END OF FILE
+==============================================================================
