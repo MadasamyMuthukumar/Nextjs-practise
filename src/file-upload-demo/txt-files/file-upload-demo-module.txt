@@ -1,0 +1,282 @@
+==============================================================================
+  FILE-UPLOAD-DEMO MODULE - FULL SOURCE
+  NestJS multer upload + magic-byte content validation (in memory, no storage)
+
+  Project : Nextjs-practise
+  Exported: 2026-09-22 23:30
+==============================================================================
+
+ROUTE EXPOSED BY THIS MODULE
+------------------------------------------------------------------------------
+  POST   /files/upload    public, multipart/form-data, field name "file"
+                          -> { ok, filename, mime, ext, hash }
+                          -> 400 Bad Request on any failed check
+
+  The whole module is @SkipThrottle'd, otherwise the global 3-requests-per-minute
+  ThrottlerGuard in AppModule makes upload testing painful.
+
+VALIDATION ORDER  (file-upload-demo.service.ts - any failure throws 400)
+------------------------------------------------------------------------------
+  1. file present               multer gives undefined when the field is missing
+  2. strip the path             path.win32.basename then path.posix.basename,
+                                so "..\..\etc\passwd.pdf" becomes "passwd.pdf"
+                                (both are needed - a windows client sends "\",
+                                 a unix client sends "/")
+  3. extension allowlisted      path.extname() KEEPS the dot, so the keys in
+                                allowedTypes are ".jpg" not "jpg"
+  4. declared mime must match   file.mimetype comes from the CLIENT and is a
+                                claim, not a fact - it is only the cheap check
+  5. magic bytes must match     fromBuffer() reads the real signature from the
+                                first bytes of the buffer. this is the check
+                                that actually stops a renamed file
+  6. sha256 of the bytes        returned so the same upload is identifiable
+
+  Steps 4 and 5 together are the point of the demo: the client says
+  "image/jpeg", the bytes say "application/pdf", and the request is rejected.
+
+ALLOWED TYPES (hardcoded in file-upload-demo.service.ts)
+------------------------------------------------------------------------------
+  .jpg   -> image/jpeg
+  .jpeg  -> image/jpeg
+  .pdf   -> application/pdf
+
+  jpeg magic bytes = FF D8 FF ...     pdf magic bytes = 25 50 44 46  ("%PDF")
+
+UPLOAD LIMITS (multer options on the FileInterceptor)
+------------------------------------------------------------------------------
+  memoryStorage()          nothing is written to disk, bytes live on file.buffer
+  files: 1                 a second file field is rejected by multer
+  fileSize: 10 * 1024 * 1024   multer aborts oversized uploads before the
+                               service ever runs
+
+  memoryStorage is fine for a 10MB demo. For large files it holds the whole
+  upload in RAM per request - diskStorage or a stream would be the real answer.
+
+TRY IT
+------------------------------------------------------------------------------
+  # accepted - real jpeg, correct extension, correct mime
+  curl -F "file=@photo.jpg;type=image/jpeg" http://localhost:3000/files/upload
+  -> {"ok":"success","filename":"photo.jpg","mime":"image/jpeg","ext":"jpg","hash":"d20f6f..."}
+
+  # rejected - a pdf renamed to .jpg with a faked mime. this is the attack
+  curl -F "file=@doc.pdf;filename=evil.jpg;type=image/jpeg" http://localhost:3000/files/upload
+  -> {"message":"Bad Request","statusCode":400}
+
+  # rejected - extension not on the allowlist
+  curl -F "file=@notes.txt;type=text/plain" http://localhost:3000/files/upload
+  -> {"message":"Bad Request","statusCode":400}
+
+  # accepted, but stored as "passwd.pdf" - the traversal is stripped
+  curl -F "file=@doc.pdf;filename=../../etc/passwd.pdf;type=application/pdf" http://localhost:3000/files/upload
+
+WHY file-type IS PINNED TO v16
+------------------------------------------------------------------------------
+  file-type v22 is pure ESM: its package.json has "type": "module", an
+  exports-only entry, no "main", no "types", and engines.node >= 22.
+
+  This project compiles with module: commonjs and no moduleResolution, which
+  means node10 resolution - and node10 IGNORES the exports field. So v22 fails
+  at compile time with:
+
+    error TS2307: Cannot find module 'file-type' or its corresponding type
+    declarations.
+
+  A newer TypeScript (the one bundled with the editor) gets past resolution and
+  then fails differently, because @types/node 20 predates generic typed arrays:
+
+    Argument of type 'Buffer' is not assignable to parameter of type
+    'ArrayBuffer | Uint8Array<ArrayBufferLike>'
+
+  Two errors, one cause. file-type@16.5.4 is the last CommonJS release: it has
+  main + types, and its fromBuffer() accepts a Buffer directly, so both errors
+  disappear with no tsconfig change. The API name differs between versions:
+
+    v16   import { fromBuffer } from 'file-type'           <- what this uses
+    v22   import { fileTypeFromBuffer } from 'file-type'
+
+  To move to v22 later: set module + moduleResolution to "nodenext" and upgrade
+  typescript to >= 5.8. Node itself is already fine - require(esm) works from
+  Node 22.12 onward.
+
+FILE INDEX
+------------------------------------------------------------------------------
+  1. src/file-upload-demo/file-upload-demo.module.ts
+  2. src/file-upload-demo/file-upload-demo.service.ts
+  3. src/file-upload-demo/file-upload-demo.controller.ts
+  A. src/app.module.ts   (appendix - the registration that makes it all work)
+  B. package.json        (appendix - the dependencies this module needs)
+
+
+==============================================================================
+  FILE 1:  src/file-upload-demo/file-upload-demo.module.ts
+------------------------------------------------------------------------------
+  Module wiring. An empty controllers/providers array here means the route
+  is never mapped - the module loads, and POST /files/upload still 404s.
+==============================================================================
+
+import { Module } from "@nestjs/common";
+import { FileUploadDemoController } from "./file-upload-demo.controller";
+import { FileUploadDemoService } from "./file-upload-demo.service";
+
+
+@Module({
+    imports: [],
+    controllers: [FileUploadDemoController],
+    providers: [FileUploadDemoService]
+})
+
+
+export class FileUploadDemoModule {}
+
+==============================================================================
+  FILE 2:  src/file-upload-demo/file-upload-demo.service.ts
+------------------------------------------------------------------------------
+  All the validation. Note "import * as path" - a default import compiles here
+  (allowSyntheticDefaultImports is on) but emits path_1.default under
+  CommonJS, which is undefined at runtime because esModuleInterop is off.
+==============================================================================
+
+/// <reference types="multer" />
+import { BadRequestException, Injectable } from "@nestjs/common";
+import { createHash } from "crypto";
+import { fromBuffer } from "file-type";
+import * as path from "path";
+
+
+@Injectable()
+export class FileUploadDemoService {
+
+    private readonly allowedTypes: Record<string, string> = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.pdf': 'application/pdf'
+    }
+
+    async validate(file: Express.Multer.File) {
+
+        if (!file) throw new BadRequestException()
+
+        const safename = path.posix.basename(
+            path.win32.basename(file.originalname)
+        )
+
+        const extension = path.extname(safename).toLowerCase()
+
+        const expectedType = this.allowedTypes[extension]
+
+        if (!expectedType || file.mimetype != expectedType) throw new BadRequestException()
+
+        const detected = await fromBuffer(file.buffer)
+
+        if (!detected || detected.mime !== expectedType) throw new BadRequestException()
+
+        const hash = createHash('sha256').update(file.buffer).digest('hex')
+
+        return {
+            ok: "success",
+            filename: safename,
+            mime: detected.mime,
+            ext: detected.ext,
+            hash
+        }
+
+
+    }
+}
+
+==============================================================================
+  FILE 3:  src/file-upload-demo/file-upload-demo.controller.ts
+------------------------------------------------------------------------------
+  POST /files/upload. FileInterceptor('file') must use the same field name the
+  client sends, otherwise @UploadedFile() is undefined and the service 400s.
+==============================================================================
+
+import { Controller, Post, UploadedFile, UseInterceptors } from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
+import { memoryStorage } from "multer";
+import { FileUploadDemoService } from "./file-upload-demo.service";
+import { SkipThrottle } from "@nestjs/throttler";
+
+@SkipThrottle({ long: true, short: true})
+@Controller('files')
+export class FileUploadDemoController {
+    constructor(
+        private readonly fileService: FileUploadDemoService
+    ){}
+
+    @UseInterceptors(FileInterceptor('file',{
+        storage: memoryStorage(),
+        limits: {
+            files:1,
+            fileSize: 10 * 1024 * 1024
+        }
+    }))
+    @Post('upload')
+    async uploadFile(
+        @UploadedFile() file: Express.Multer.File
+    ){
+          const fileUpload = await this.fileService.validate(file)
+          return fileUpload;
+    }
+}
+
+==============================================================================
+  APPENDIX A:  src/app.module.ts
+------------------------------------------------------------------------------
+  Not part of the module, but required. A controller only gets a route if its
+  module is registered here. Without the FileUploadDemoModule line below,
+  POST /files/upload returns 404 Not Found.
+
+  Only the imports array is shown - the rest of the file is in the auth-demo
+  and websocket-demo exports.
+==============================================================================
+
+import { FileUploadDemoModule } from './file-upload-demo/file-upload-demo.module';
+
+@Module({
+  imports: [ConfigModule.forRoot({
+    isGlobal:true
+  }),
+     AuthModule, UserModule, BookmarkModule, PrismaModule,
+    ThrottlerModule.forRoot([
+      {
+        name:'long',
+      ttl:60000,
+      limit:3  //this is why the upload controller is @SkipThrottle'd
+    },
+    {
+      name:'short',
+      ttl:1000,
+      limit:2
+    }
+  ]) , EventEmitterModule.forRoot() , ScheduleModule.forRoot(), ListenerModule,
+  AuthDemoModule, WebsocketDemoModule, FileUploadDemoModule],
+  controllers: [AppController],
+
+  providers: [AppService,{
+    provide:APP_GUARD,
+    useClass:ThrottlerGuard,
+  }],
+})
+export class AppModule {}
+
+==============================================================================
+  APPENDIX B:  package.json
+------------------------------------------------------------------------------
+  What this module pulls in. @nestjs/platform-express was already there.
+==============================================================================
+
+  dependencies
+    "file-type": "^16.5.4"                 last CommonJS release - see the note
+    "multer": "^2.4.0"                     memoryStorage + the upload limits
+    "@nestjs/platform-express": "^10.0.0"  provides FileInterceptor
+
+  devDependencies
+    "@types/multer": "^1.4.13"             gives the Express.Multer.File type
+
+  crypto and path are Node built-ins - nothing to install.
+
+
+==============================================================================
+  END OF FILE
+==============================================================================
