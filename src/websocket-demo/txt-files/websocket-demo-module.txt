@@ -1,0 +1,361 @@
+==============================================================================
+  WEBSOCKET-DEMO MODULE - FULL SOURCE
+  NestJS socket.io gateway - private + group chat (in-memory, no database)
+
+  Project : Nextjs-practise
+  Exported: 2026-09-22 16:24
+==============================================================================
+
+HOW A CLIENT CONNECTS
+------------------------------------------------------------------------------
+  The gateway runs on the same port as the HTTP app (default 3000).
+  Identity comes from a handshake query param - there is no JWT here:
+
+    const socket = io('http://localhost:3000', { query: { userId: 'u1' } })
+
+  If userId is missing or unknown, handleConnection disconnects the socket.
+
+EVENTS THIS GATEWAY LISTENS FOR  (client -> server)
+------------------------------------------------------------------------------
+  join_group             { groupId }                 must be a member
+  send_private_message   { receiverId, message }     receiver must exist
+  send_group_message     { groupId, message }        must be a member
+
+EVENTS THIS GATEWAY EMITS  (server -> client)
+------------------------------------------------------------------------------
+  connected        { message, userId }        on successful handshake
+  group_joined     { groupId, userId }        to the joiner and to the room
+  private_message  { message }                to user:<receiverId> and sender
+  group_message    { message }                to group:<groupId>
+
+ROOM NAMING
+------------------------------------------------------------------------------
+  user:<userId>     every socket auto-joins this on connect
+  group:<groupId>   joined explicitly via the join_group event
+
+TEST DATA (hardcoded in websocket-demo.service.ts)
+------------------------------------------------------------------------------
+  users:   u1 guna      u2 vimal     u3 sathya
+  groups:  g1 Engineering  -> u1, u2, u3
+           g2 Cricket      -> u1, u3        (u2 is NOT a member)
+
+FILE INDEX
+------------------------------------------------------------------------------
+  1. src/websocket-demo/websocket-demo.module.ts
+  2. src/websocket-demo/websocket-demo.service.ts
+  3. src/websocket-demo/websocket-demo.gateway.ts
+  A. src/app.module.ts   (appendix - the registration that makes it all work)
+
+
+==============================================================================
+  FILE 1:  src/websocket-demo/websocket-demo.module.ts
+------------------------------------------------------------------------------
+  Module wiring. A gateway is a provider, not a controller - it is listed
+  in `providers`, and there are no controllers in this module at all.
+==============================================================================
+
+import { Module } from "@nestjs/common";
+import { WebsocketDemoService } from "./websocket-demo.service";
+import { WebsocketDemoGateway } from "./websocket-demo.gateway";
+
+
+
+
+
+@Module({
+    imports:[],
+    providers: [WebsocketDemoService, WebsocketDemoGateway],
+    controllers:[]
+})
+export class WebsocketDemoModule {}
+
+==============================================================================
+  FILE 2:  src/websocket-demo/websocket-demo.service.ts
+------------------------------------------------------------------------------
+  In-memory user + group store (no database). The gateway asks this
+  service three questions: does the user exist, does the group exist,
+  and is that user a member of that group.
+==============================================================================
+
+import { Injectable } from "@nestjs/common";
+
+export interface User {
+   id: string,
+   name: string
+}
+
+export interface Group {
+   id: string,
+   name: string,
+   members: Set<string>
+}
+
+@Injectable()
+export class WebsocketDemoService {
+    constructor(){}
+
+
+    private users = new Map<String, User>([
+        ['u1', { id: 'u1', name: 'guna'}],
+        ['u2', { id: 'u2', name: 'vimal'}],
+        ['u3', { id: 'u3', name: 'sathya'}]
+    ])
+
+
+    private groups = new Map<string, Group>([
+         ['g1', { id: 'g1', name:'Engineering', members: new Set(['u1', 'u2', 'u3'])}],
+         ['g2', { id: 'g2', name:'Cricket', members: new Set(['u1', 'u3'])}]
+    ])
+
+
+    getUser(id: string){
+         return this.users.get(id)
+    }
+
+    groupExists(id){
+       return this.groups.has(id)
+    }
+
+    isGroupMember(userId, groupId){
+        return this.groups.get(groupId)?.members.has(userId) ?? false
+    }
+}
+
+==============================================================================
+  FILE 3:  src/websocket-demo/websocket-demo.gateway.ts
+------------------------------------------------------------------------------
+  The gateway itself. Lifecycle hooks (connect/disconnect) plus the three
+  @SubscribeMessage handlers. Note the @SkipThrottle at the top - the
+  global ThrottlerGuard would otherwise crash on every ws event.
+==============================================================================
+
+import { ConnectedSocket, MessageBody, OnGatewayConnection, OnGatewayDisconnect, SubscribeMessage, WebSocketGateway, WebSocketServer, WsException } from "@nestjs/websockets";
+import { Server, Socket } from "socket.io";
+import { WebsocketDemoService } from "./websocket-demo.service";
+import { SkipThrottle } from "@nestjs/throttler";
+
+
+// the global ThrottlerGuard (APP_GUARD) runs on @SubscribeMessage handlers too, and it
+// reads req/res positionally via switchToHttp() — in a ws context that makes `res` the
+// message payload, so res.header(...) throws on every event. both names are listed
+// because app.module registers named throttlers ('long'/'short'), not 'default'.
+@SkipThrottle({  long: true, short:true})
+@WebSocketGateway({
+    origin: '*'
+})
+export class WebsocketDemoGateway implements OnGatewayConnection, OnGatewayDisconnect {
+
+    constructor(
+        private readonly chatService: WebsocketDemoService
+    ) { }
+
+    @WebSocketServer() server: Server
+
+
+    async handleConnection(client: Socket, ...args: any[]) {
+
+        const userId = this.getAuthIdFromHandshake(client)
+
+        const isUser = this.chatService.getUser(userId)
+
+        if (!isUser) {
+            client.disconnect(true)
+            throw new WsException('error')
+        }
+
+        client.data.userId = userId
+
+        await client.join(`user:${userId}`)
+
+        client.emit('connected', {
+            message: 'user connected',
+            userId: userId
+        })
+
+
+    }
+
+
+    async handleDisconnect(client: any) {
+        console.log('cliet disconnected')
+    }
+
+
+    @SubscribeMessage('join_group')
+    async joinGroup(
+        @ConnectedSocket() client: Socket,
+        @MessageBody() body: { groupId: string }
+    ) {
+        const userId = this.requireUserId(client)
+
+        const isUser = this.chatService.getUser(userId)
+
+        if (!isUser) throw new WsException('no user')
+
+        const groupExists = this.chatService.groupExists(body.groupId)
+        const groupMemberExists = this.chatService.isGroupMember(userId, body.groupId)
+
+        if (!groupExists || !groupMemberExists) throw new WsException('Not valid group or member')
+
+        client.join(`group:${body.groupId}`)
+
+        client.emit('group_joined', {
+            grupdId: body.groupId,
+            userId
+        })
+
+        this.server.to(`group:${body.groupId}`).emit('group_joined', {
+            groupId: body.groupId,
+            userId
+        })
+
+
+        return {
+            ok: true,
+            groupId: body.groupId,
+            userId
+        }
+
+    }
+
+
+
+    @SubscribeMessage('send_private_message')
+    async sendPrivateMessage(
+        @ConnectedSocket() client: Socket,
+        @MessageBody() body: { receiverId: string, message: string }
+    ) {
+        const receiverId = body.receiverId
+
+        const userId = this.requireUserId(client)
+
+        const isUser = this.chatService.getUser(receiverId)
+
+        if (!isUser) throw new WsException('no user')
+
+        this.server.to(`user:${receiverId}`).emit('private_message', {
+            message: body.message
+        })
+
+        client.emit('private_message', {
+            message: body.message
+        })
+
+        return {
+            ok: true,
+            message: body.message
+        }
+    }
+
+
+    @SubscribeMessage('send_group_message')
+    async sendGroupMessage(
+        @ConnectedSocket() client: Socket,
+        @MessageBody() body: { groupId: string, message: string }
+    ) {
+        const userId = this.requireUserId(client)
+
+        const isUser = this.chatService.getUser(userId)
+
+        if (!isUser) throw new WsException('no user')
+
+        const groupExists = this.chatService.groupExists(body.groupId)
+        const groupMemberExists = this.chatService.isGroupMember(userId, body.groupId)
+
+        if (!groupExists || !groupMemberExists) throw new WsException('Not valid group or member')
+
+        this.server.to(`group:${body.groupId}`).emit('group_message', {
+            message: body.message
+        })
+
+        return {
+            ok: true,
+            message: body.message
+        }
+
+
+
+
+    }
+
+
+    private requireUserId(client: Socket) {
+          return client.data.userId ?? null
+    }
+
+    private getAuthIdFromHandshake(client: Socket): string | null {
+
+        // socket.io types a query param as string | string[] because ?userId=a&userId=b is legal
+        const query = client.handshake.query?.userId
+
+        const userId = Array.isArray(query) ? query[0] : query
+
+        return typeof userId === 'string' && userId.length > 0 ? userId : null
+
+    }
+
+
+
+}
+
+==============================================================================
+  APPENDIX A:  src/app.module.ts
+------------------------------------------------------------------------------
+  Not part of the module, but required. A gateway only starts listening
+  if its module is registered here. Without the WebsocketDemoModule line
+  below, the socket.io server never attaches and clients cannot connect.
+
+  Also note ThrottlerModule.forRoot registers the named throttlers
+  'long' and 'short' - that is why the gateway must write
+  @SkipThrottle({ long: true, short: true }) and not a bare @SkipThrottle().
+==============================================================================
+
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { AuthModule } from './auth/auth.module';
+import { UserModule } from './user/user.module';
+import { BookmarkModule } from './bookmark/bookmark.module';
+import { PrismaModule } from './prisma/prisma.module';
+import { ConfigModule } from '@nestjs/config';
+// import { ServiceController } from './service/service.controller';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { ScheduleModule } from '@nestjs/schedule';
+import { ListenerModule } from './listener/listener.module';
+import { AuthDemoModule } from './auth-demo/auth-demo.module';
+import { WebsocketDemoModule } from './websocket-demo/websocket-demo.module';
+@Module({
+  imports: [ConfigModule.forRoot({
+    isGlobal:true //making cofigService globally available
+  }), //this will add our env file to all our application
+     AuthModule, UserModule, BookmarkModule, PrismaModule,
+     //we are defining two limits here short & long
+    ThrottlerModule.forRoot([
+      {
+        name:'long',
+      ttl:60000,
+      limit:3  //limiting 3 request per minute
+    },
+    {
+      name:'short',
+      ttl:1000,
+      limit:2
+    }
+  ]) , EventEmitterModule.forRoot() , ScheduleModule.forRoot(), ListenerModule, AuthDemoModule, WebsocketDemoModule],
+  controllers: [AppController],
+
+  providers: [AppService,{
+    provide:APP_GUARD,   //providing rate limiting to all our controller routes
+    useClass:ThrottlerGuard,
+
+
+  }],
+})
+export class AppModule {}
+
+
+==============================================================================
+  END OF FILE
+==============================================================================
