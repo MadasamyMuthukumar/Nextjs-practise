@@ -15,6 +15,7 @@ import { ListenerModule } from './listener/listener.module';
 import { AuthDemoModule } from './auth-demo/auth-demo.module';
 import { WebsocketDemoModule } from './websocket-demo/websocket-demo.module';
 import { FileUploadDemoModule } from './file-upload-demo/file-upload-demo.module';
+import { UrlShortnerDemoModule } from './url-shortner-demo/url-shortner-demo.module';
 @Module({
   imports: [ConfigModule.forRoot({
     isGlobal:true //making cofigService globally available 
@@ -32,7 +33,7 @@ import { FileUploadDemoModule } from './file-upload-demo/file-upload-demo.module
       ttl:1000,
       limit:2
     }
-  ]) , EventEmitterModule.forRoot() , ScheduleModule.forRoot(), ListenerModule, AuthDemoModule, WebsocketDemoModule, FileUploadDemoModule], 
+  ]) , EventEmitterModule.forRoot() , ScheduleModule.forRoot(), ListenerModule, AuthDemoModule, WebsocketDemoModule, FileUploadDemoModule, UrlShortnerDemoModule], 
   controllers: [AppController],
 
   providers: [AppService,{
