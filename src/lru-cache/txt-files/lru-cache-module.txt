@@ -1,0 +1,282 @@
+==============================================================================
+  LRU-CACHE MODULE - FULL SOURCE
+  Least Recently Used cache - Map + doubly linked list, O(1) get and set
+
+  Project : Nextjs-practise
+  Exported: 2026-09-24 22:41
+==============================================================================
+
+WHAT THIS MODULE DOES
+------------------------------------------------------------------------------
+  A key/value cache with a fixed capacity. When a new key would push it
+  past that capacity, it throws away the key that was used LEAST recently.
+  Both get() and set() count as a "use" - reading a key protects it from
+  eviction just as much as writing it does.
+
+  It is a plain TypeScript class, not a Nest provider. No controller, no
+  routes, nothing registered in app.module.ts. You drive it from a script.
+
+HOW TO RUN THE DEMO
+------------------------------------------------------------------------------
+  From the project root:
+
+    npx ts-node src/lru-cache/lru-cache.service.ts
+
+  Watch the spelling: lru-CACHE, not lru-cahce. A typo in the path gives
+  "Error: Cannot find module './lru-cahce.service.ts'" (MODULE_NOT_FOUND),
+  which looks like a code problem but is only the file name.
+
+  If ts-node is missing:  npm i -D ts-node
+
+EXPECTED OUTPUT  (capacity = 3)
+------------------------------------------------------------------------------
+    20
+    30
+    10
+    10
+    undefined
+    30
+
+  Step by step. The list is written MRU (most recent) -> LRU (least recent);
+  the right-most key is always the next one to be evicted.
+
+    set A=10          [ A ]
+    set B=20          [ B  A ]
+    set C=30          [ C  B  A ]           full
+    get B   -> 20     [ B  C  A ]           B jumps to the front
+    get C   -> 30     [ C  B  A ]
+    get A   -> 10     [ A  C  B ]           B is now the least recent
+    set D=40          [ D  A  C  B ]        size 4 > 3  ->  evict B
+                      [ D  A  C ]
+    get A   -> 10     [ A  D  C ]
+    get B   -> undefined                    B was evicted
+    get C   -> 30     [ C  A  D ]
+
+  The "undefined" line is the proof the cache works. If B still prints 20,
+  eviction is broken (see bug 1 below).
+
+DATA STRUCTURE - WHY GET AND SET ARE O(1)
+------------------------------------------------------------------------------
+  Two structures, each covering the other's weakness:
+
+    Map<K, Node>          key -> node lookup in O(1)
+                          but it cannot tell you cheaply "who is oldest"
+    doubly linked list    keeps usage order; unlinking or moving a node is
+                          O(1) because the node knows its prev and next
+                          but finding a key in a list alone would be O(n)
+
+    head <-> [most recent] <-> ... <-> [least recent] <-> tail
+
+  head and tail are DUMMY (sentinel) nodes that hold no data. Because every
+  real node always has a real prev and next, removeNode/addToFront never
+  need "am I the first / last node / is the list empty" checks.
+
+    head.next  = most recently used
+    tail.prev  = least recently used  = the eviction victim
+
+OPERATIONS
+------------------------------------------------------------------------------
+  get(key)          O(1)   miss -> undefined. hit -> move node to front,
+                           return its value.
+  set(key, value)   O(1)   key exists -> update value, move to front.
+                           new key    -> add to map + front of list; if
+                           size > capacity, remove tail.prev from the list
+                           AND delete its key from the map.
+  removeNode(node)  O(1)   stitch node.prev and node.next together, then
+                           clear the node's own links.
+  addToFront(node)  O(1)   insert right after head.
+
+  The evicted node's key is read from lruNode.key - that is why each Node
+  stores its key and not only its value. Without it you could unlink the
+  node but would not know which Map entry to delete.
+
+BUGS THAT WERE FIXED IN THIS MODULE  (keep these in mind)
+------------------------------------------------------------------------------
+  1. The constructor validated capacity but never did
+     `this.capacity = capacity`. this.capacity stayed undefined, and
+     `size > undefined` is always false, so NOTHING was ever evicted - the
+     cache grew forever. TypeScript did not complain because
+     strictPropertyInitialization is off in this tsconfig.
+  2. removeNode left the detached node still pointing at its old
+     neighbours. Harmless in the current flow, but it now sets
+     node.prev = node.next = null so a removed node holds no stale links.
+
+  Still open - worth mentioning if asked:
+  - `capacity <= 0` lets NaN, Infinity and 2.5 through. Stricter:
+    `!Number.isInteger(capacity) || capacity <= 0`.
+  - BadRequestException is a Nest HTTP exception inside a plain data
+    structure. RangeError would fit better and drop the @nestjs import.
+  - removeNode / addToFront are public, so outside code could corrupt the
+    list. They should be private.
+  - `prev: Node<K,V> = null` only compiles because strictNullChecks is
+    off. The honest type is Node<K,V> | null.
+
+INTERVIEW TALKING POINTS
+------------------------------------------------------------------------------
+  - Why not an array? Moving an item to the front / removing from the
+    middle is O(n). The linked list makes both O(1).
+  - Why not only a linked list? Finding a key would be O(n). The Map gives
+    O(1) lookup straight to the node.
+  - JS shortcut: a Map alone remembers insertion order. delete + set moves
+    a key to the end, and map.keys().next().value is the oldest. That works
+    in JavaScript, but the Map + linked list version is the language-
+    agnostic answer interviewers usually expect.
+  - Space: O(capacity).
+  - Real uses: browser caches, DB buffer pools, CDN / in-memory API caches.
+
+FILE INDEX
+------------------------------------------------------------------------------
+  1. src/lru-cache/lru-cache.ts
+  2. src/lru-cache/lru-cache.service.ts   (demo script - run with ts-node)
+
+
+==============================================================================
+  FILE 1:  src/lru-cache/lru-cache.ts
+------------------------------------------------------------------------------
+  The cache itself. Node<K,V> is one entry in the doubly linked list;
+  LRUCache<K,V> owns the Map, the two sentinel nodes and the capacity.
+  Eviction happens at the end of set(), after the new node is already in -
+  so the cache is briefly capacity + 1 before tail.prev is dropped.
+==============================================================================
+
+import { BadRequestException } from "@nestjs/common"
+
+
+export class Node<K, V> {
+    key: K
+    value: V
+
+    prev: Node<K, V> = null
+    next: Node<K, V> = null
+
+
+    constructor(key: K, value: V) {
+        this.key = key
+        this.value = value
+
+    }
+}
+
+export class LRUCache<K, V> {
+
+    private readonly capacity: number
+
+    private cache = new Map<K, Node<K, V>>()
+
+    private head: Node<K, V>
+    private tail: Node<K, V>
+
+    constructor(capacity: number) {
+        if (capacity <= 0) throw new BadRequestException()
+
+        this.capacity = capacity
+
+        this.head = new Node(null, null)
+        this.tail = new Node(null, null)
+
+        this.head.next = this.tail
+        this.tail.prev = this.head
+    }
+
+    get(key: K): V | undefined {
+        const node = this.cache.get(key)
+
+        if (!node) return undefined
+
+        this.removeNode(node)
+        this.addToFront(node)
+
+        return node.value
+    }
+
+    set(key: K, value: V) {
+        const existingNode = this.cache.get(key)
+
+        if (existingNode) {
+            existingNode.value = value
+
+            this.removeNode(existingNode)
+            this.addToFront(existingNode)
+            return
+        }
+
+        const newNode = new Node(key, value)
+
+        this.cache.set(key, newNode)
+
+        this.addToFront(newNode)
+
+        if (this.cache.size > this.capacity) {
+            const lruNode = this.tail.prev
+
+            if (lruNode && lruNode !== this.head) {
+                this.removeNode(lruNode)
+                this.cache.delete(lruNode.key)
+            }
+        }
+    }
+
+    removeNode(node: Node<K, V>) {
+        const prevNode = node.prev
+        const nextNode = node.next
+
+        prevNode.next = nextNode
+        nextNode.prev = prevNode
+
+        node.prev = node.next = null
+
+    }
+
+    addToFront(node: Node<K, V>) {
+        const firstNode = this.head.next
+
+        firstNode.prev = node
+        node.next = firstNode
+
+        node.prev = this.head
+        this.head.next = node
+    }
+
+
+
+
+}
+
+==============================================================================
+  FILE 2:  src/lru-cache/lru-cache.service.ts
+------------------------------------------------------------------------------
+  Despite the .service.ts name this is not a Nest @Injectable - it is a
+  plain script that builds a cache of 3, reads everything, then adds a 4th
+  key to force an eviction. Run it with:
+
+    npx ts-node src/lru-cache/lru-cache.service.ts
+==============================================================================
+
+import { LRUCache } from "./lru-cache";
+
+
+const cache = new LRUCache(3)
+
+cache.set('A', 10)
+cache.set('B', 20)
+cache.set('C', 30)
+
+console.log(cache.get('B'))
+
+console.log(cache.get('C'))
+
+console.log(cache.get('A'))
+
+cache.set('D', 40)
+
+console.log(cache.get('A'))
+
+console.log(cache.get('B'))
+
+console.log(cache.get('C'))
+
+
+
+==============================================================================
+  END OF FILE
+==============================================================================
