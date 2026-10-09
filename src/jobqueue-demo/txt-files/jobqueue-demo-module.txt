@@ -1,0 +1,265 @@
+==============================================================================
+  JOBQUEUE-DEMO MODULE - FULL SOURCE
+  Concurrency-limited job queue - run at most N async jobs at the same time
+
+  Project : Nextjs-practise
+  Exported: 2026-09-28 15:34
+==============================================================================
+
+WHAT THIS MODULE DOES
+------------------------------------------------------------------------------
+  A queue of async jobs with a fixed number of "workers". addJob() puts a
+  job in the queue and immediately tries to start it. If all workers are
+  busy, the job waits. When a running job finishes (success OR failure),
+  its worker is freed and the next waiting job is started.
+
+  With workers = 3 and 5 jobs: jobs 1-3 start at once, jobs 4 and 5 wait,
+  and each one starts as soon as an earlier job finishes.
+
+  It is a plain TypeScript class, not a Nest provider. No controller, no
+  routes, nothing registered in app.module.ts. You drive it from a script.
+
+HOW TO RUN THE DEMO
+------------------------------------------------------------------------------
+  From the project root:
+
+    npx ts-node src/jobqueue-demo/jobqueue-runner.ts
+
+  If ts-node is missing:  npm i -D ts-node
+
+EXPECTED OUTPUT  (workers = 3, every job takes 2 seconds)
+------------------------------------------------------------------------------
+    Job 1 enqued
+    Executing job 1
+    Job 2 enqued
+    Executing job 2
+    Job 3 enqued
+    Executing job 3
+    Job 4 enqued
+    Job 5 enqued
+    Done Job 1                         <- about 2s later
+    ------------------------------------------------
+    Executing job 4
+    Done Job 2
+    ------------------------------------------------
+    Executing job 5
+    Done Job 3
+    ------------------------------------------------
+    Done Job 4                         <- about 4s after start
+    ------------------------------------------------
+    Done Job 5
+    ------------------------------------------------
+
+  Timeline:
+
+    t = 0s    start 1, 2, 3          active = 3   queue = [4, 5]
+    t = 2s    1 done -> start 4      active = 3   queue = [5]
+              2 done -> start 5      active = 3   queue = []
+              3 done                 active = 2
+    t = 4s    4 done, 5 done         active = 0   process exits
+
+  Total time is about 4 seconds, not 10. That is the point of running
+  jobs in parallel with a limit.
+
+  Why "Executing job 1" prints BEFORE "Job 2 enqued":
+  an async function runs synchronously up to its first `await`. So
+  addJob -> processNext -> runJob -> job.task() prints "Executing job 1"
+  right away, and only pauses at the setTimeout await. Then control goes
+  back to the runner, which calls addJob(2).
+
+  If you only see the five "Job N enqued" lines and nothing else, the
+  workers never started - see bug 1 below.
+
+HOW IT WORKS
+------------------------------------------------------------------------------
+  State:
+
+    workers        max number of jobs allowed to run at the same time
+    activeWorkers  how many jobs are running right now  (must start at 0)
+    queue          jobs waiting for a free worker (FIFO array)
+
+  Flow:
+
+    addJob(job)
+      -> queue.push(job)
+      -> processNext()
+
+    processNext()
+      while (activeWorkers < workers AND queue is not empty)
+        job = queue.shift()          take the oldest waiting job
+        activeWorkers++              reserve a worker
+        runJob(job)                  NOT awaited - starts it and moves on
+
+    runJob(job)
+      try      await job.task()
+      catch    log the error
+      finally  activeWorkers--       free the worker
+               processNext()         pull the next waiting job
+
+  Two details that make it work:
+
+  - processNext does NOT await runJob. If it did, the while loop would run
+    one job at a time and the "3 workers" limit would mean nothing.
+  - activeWorkers-- and processNext() are in `finally`, so a job that
+    throws still frees its worker. If they were only in `try`, one failing
+    job would permanently use up a worker, and after 3 failures the queue
+    would stop forever.
+
+  Why the process exits by itself: once the queue is empty and every
+  setTimeout has fired, Node has nothing left pending. There is no
+  setInterval or open server keeping it alive.
+
+BUGS THAT WERE FIXED IN THIS MODULE  (keep these in mind)
+------------------------------------------------------------------------------
+  1. `private activeWorkers: number` had no initial value, so it was
+     undefined. In processNext, `undefined < 3` becomes `NaN < 3`, which
+     is false - the while loop never ran, no job ever started, and the
+     output stopped after the five "Job N enqued" lines. Fixed with
+     `private activeWorkers: number = 0`. TypeScript did not complain
+     because strictPropertyInitialization is off in this tsconfig
+     (same root cause as the capacity bug in the lru-cache module).
+
+  Still open - worth mentioning if asked:
+  - `this.queue.shift()` returns Job | undefined. It only compiles because
+    strictNullChecks is off. Safe here since the loop checks
+    queue.length > 0, so `this.queue.shift()!` states that honestly.
+  - `catch {}` throws the error away. Log which job failed and why:
+    `catch (err) { console.log(`Job ${job.id} failed`, err) }`.
+  - No check on the workers count. 0 or a negative number means nothing
+    ever runs, again silently.
+  - `createJob = (id) =>` in the runner is implicitly `any`. Should be
+    `(id: number)`.
+  - No way to know when ALL jobs are done (no onIdle() / drain promise),
+    no job result is returned, and no retry or timeout per job.
+  - Typo in the log: "enqued" -> "enqueued".
+
+INTERVIEW TALKING POINTS
+------------------------------------------------------------------------------
+  - This is a concurrency limiter, the same idea as p-limit / p-queue, or
+    Promise.all with a cap.
+  - Why not Promise.all(jobs)? It starts everything at once. 1000 API
+    calls at the same time can hit rate limits or run out of DB
+    connections. The queue caps it at N.
+  - Why not run them one by one with await in a loop? Safe, but slow:
+    5 jobs x 2s = 10s instead of about 4s.
+  - JavaScript is single-threaded - these are not real threads. The
+    "workers" are just a counter of promises in flight. It works well
+    for I/O (network, DB, files), not for CPU-heavy work. For CPU work
+    you need worker_threads or separate processes.
+  - queue.shift() on an array is O(n). Fine for a demo; a real queue with
+    many jobs would use a linked list or a head index.
+  - In-memory only: if the process crashes, waiting jobs are lost.
+    Production systems use BullMQ (Redis), RabbitMQ, SQS etc. for
+    persistence, retries and multiple servers.
+  - Real uses: email sending, image processing, web scraping, calling a
+    rate-limited third-party API.
+
+FILE INDEX
+------------------------------------------------------------------------------
+  1. src/jobqueue-demo/jobqueue.ts
+  2. src/jobqueue-demo/jobqueue-runner.ts   (demo script - run with ts-node)
+
+
+==============================================================================
+  FILE 1:  src/jobqueue-demo/jobqueue.ts
+------------------------------------------------------------------------------
+  The queue itself. Job is { id, name, task }, where task is an async
+  function with no arguments. JobQueue owns the waiting array, the worker
+  limit and the count of running jobs.
+==============================================================================
+
+
+
+type Job = {
+    id: number,
+    name: string,
+    task: () => Promise<void>
+}
+
+
+export class JobQueue {
+    private workers: number
+    private activeWorkers: number =0
+
+    private queue: Job[] = []
+
+    constructor(worker: number) {
+        this.workers = worker
+    }
+
+
+
+
+     addJob(job: Job) {
+
+        this.queue.push(job)
+        console.log(`Job ${job.id} enqued`)
+        this.processNext()
+    }
+
+    private processNext() {
+        while (
+            this.activeWorkers < this.workers &&
+            this.queue.length > 0
+        ) {
+
+            const job = this.queue.shift()
+            this.activeWorkers++
+            this.runJob(job)
+
+        }
+    }
+
+
+    private async runJob(job: Job) {
+        try {
+            const task = job.task
+            await task()
+      
+            console.log('------------------------------------------------')
+        } catch {
+            console.log('Error while executing tasks')
+        } finally {
+            this.activeWorkers--
+            this.processNext()
+        }
+    }
+}
+
+==============================================================================
+  FILE 2:  src/jobqueue-demo/jobqueue-runner.ts
+------------------------------------------------------------------------------
+  Plain script. createJob(id) builds a job that logs, waits 2 seconds and
+  logs again. It makes a queue with 3 workers and adds 5 jobs. Run it with:
+
+    npx ts-node src/jobqueue-demo/jobqueue-runner.ts
+==============================================================================
+
+import { JobQueue } from "./jobqueue"
+
+
+
+const createJob = (id) => {
+    return {
+        id,
+        name: `job-${id}`,
+        task: async () => {
+            console.log(`Executing job ${id}`)
+            await new Promise((resolve) => setTimeout(resolve, 2000))
+            console.log(`Done Job ${id}`)
+        }
+    }
+}
+
+const queue = new JobQueue(3)
+
+queue.addJob(createJob(1))
+queue.addJob(createJob(2))
+queue.addJob(createJob(3))
+queue.addJob(createJob(4))
+queue.addJob(createJob(5))
+
+
+==============================================================================
+  END OF FILE
+==============================================================================
